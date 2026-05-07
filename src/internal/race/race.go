@@ -56,3 +56,16 @@ func WriteRange(addr unsafe.Pointer, len int)
 
 //go:linkname Errors
 func Errors() int
+
+// PoolQuarantine marks [ptr, ptr+size) as quarantined after Pool.Put.
+// Any access to this region before PoolUnquarantine is called will be
+// reported as a use-after-pool-put error.
+//
+//go:linkname PoolQuarantine
+func PoolQuarantine(ptr unsafe.Pointer, size uintptr)
+
+// PoolUnquarantine clears the quarantine mark on [ptr, ptr+size).
+// Called when Pool.Get returns this object to the caller.
+//
+//go:linkname PoolUnquarantine
+func PoolUnquarantine(ptr unsafe.Pointer, size uintptr)

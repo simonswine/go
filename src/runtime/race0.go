@@ -43,3 +43,5 @@ func racegostart(pc uintptr) uintptr                                        { th
 func racegoend()                                                            { throw("race") }
 func racectxstart(spawnctx, racectx uintptr) uintptr                        { throw("race"); return 0 }
 func racectxend(racectx uintptr)                                            { throw("race") }
+func racePoolQuarantine(ptr unsafe.Pointer, size uintptr)                   { throw("race") }
+func racePoolUnquarantine(ptr unsafe.Pointer, size uintptr)                 { throw("race") }

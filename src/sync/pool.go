@@ -5,6 +5,7 @@
 package sync
 
 import (
+	"internal/abi"
 	"internal/race"
 	rtatomic "internal/runtime/atomic"
 	"runtime"
@@ -96,6 +97,31 @@ func poolRaceAddr(x any) unsafe.Pointer {
 	return unsafe.Pointer(&poolRaceHash[h%uint32(len(poolRaceHash))])
 }
 
+// poolObjectPtrSize returns the data pointer and size to quarantine for a pool
+// item. For pointer types (*T), it returns the pointer value and sizeof(T) so
+// that the pointed-to heap object is quarantined. Returns (nil, 0) for nil,
+// non-pointer, or zero-size values.
+func poolObjectPtrSize(x any) (unsafe.Pointer, uintptr) {
+	if x == nil {
+		return nil, 0
+	}
+	// Interface layout: [type *abi.Type, data unsafe.Pointer].
+	words := (*[2]unsafe.Pointer)(unsafe.Pointer(&x))
+	typ := (*abi.Type)(words[0])
+	if typ.Kind() != abi.Pointer {
+		return nil, 0
+	}
+	ptr := words[1] // for pointer types, the data word IS the pointer
+	if ptr == nil {
+		return nil, 0
+	}
+	size := (*abi.PtrType)(unsafe.Pointer(typ)).Elem.Size_
+	if size == 0 {
+		return nil, 0
+	}
+	return ptr, size
+}
+
 // Put adds x to the pool.
 func (p *Pool) Put(x any) {
 	if x == nil {
@@ -118,6 +144,9 @@ func (p *Pool) Put(x any) {
 	runtime_procUnpin()
 	if race.Enabled {
 		race.Enable()
+		if ptr, size := poolObjectPtrSize(x); ptr != nil {
+			race.PoolQuarantine(ptr, size)
+		}
 	}
 }
 
@@ -150,6 +179,9 @@ func (p *Pool) Get() any {
 		race.Enable()
 		if x != nil {
 			race.Acquire(poolRaceAddr(x))
+			if ptr, size := poolObjectPtrSize(x); ptr != nil {
+				race.PoolUnquarantine(ptr, size)
+			}
 		}
 	}
 	if x == nil && p.New != nil {

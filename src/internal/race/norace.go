@@ -53,3 +53,7 @@ func WriteRange(addr unsafe.Pointer, len int) {
 }
 
 func Errors() int { return 0 }
+
+func PoolQuarantine(ptr unsafe.Pointer, size uintptr) {}
+
+func PoolUnquarantine(ptr unsafe.Pointer, size uintptr) {}
