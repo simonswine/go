@@ -51,6 +51,18 @@ var poolGuardSuppressPatterns []poolGuardSuppressPattern
 // function names for exactness:
 //
 //	POOLGUARD_SUPPRESS==fmt.(*pp).free,=net/http.putBufioWriter
+//
+// Standard library and common framework pools that are known-safe and should
+// be suppressed when running against typical Go applications:
+//
+//	fmt,regexp,sync,net,encoding,compress,crypto,bytes,strings,io,
+//	google.golang.org/grpc,google.golang.org/protobuf,
+//	connectrpc.com,github.com/parquet-go,github.com/prometheus,
+//	github.com/grafana/dskit
+//
+// These packages access pooled slice backing arrays after Pool.Put, but do
+// so safely — no alias escapes the Put boundary.  Application-level pools
+// (like Pyroscope's bufferpool) should NOT appear in this list.
 func poolGuardInitSuppressPatterns() {
 	env := gogetenv("POOLGUARD_SUPPRESS")
 	if env == "" {
@@ -230,14 +242,10 @@ func poolGuardLookup(addr uintptr) *poolGuardPage {
 // If the backing array is already one of our mmap regions: unprotect it
 // so the caller can read/write normally.
 //
-// If it is a plain heap allocation AND large enough to benefit from page
-// isolation (>= physPageSize): migrate it to a fresh mmap region now,
+// If it is a plain heap allocation: migrate it to a fresh mmap region now,
 // updating hdrData so the caller's pointer is redirected.  Any aliases the
 // caller creates between Get and Put will then point into the mmap region.
 // When Put calls poolGuardPutBacking, it just mprotects those pages.
-//
-// Small backing arrays (< physPageSize) are skipped to avoid migrating
-// internal library pools (regexp, fmt, etc.) that operate on small buffers.
 func poolGuardGetBacking(hdrData *unsafe.Pointer, hdrCap int, elemSize uintptr) {
 	if *hdrData == nil || hdrCap == 0 || elemSize == 0 {
 		return
@@ -260,12 +268,6 @@ func poolGuardGetBacking(hdrData *unsafe.Pointer, hdrCap int, elemSize uintptr) 
 		return
 	}
 	dataSize := uintptr(hdrCap) * elemSize
-	// Skip small backing arrays to avoid migrating internal library pools
-	// (regexp, fmt, connect, etc.) that use sub-page buffers.  The TSDB
-	// bufferpool and similar use-case buffers are always large (≥ 64 KiB).
-	if dataSize < physPageSize {
-		return
-	}
 	newBase := poolGuardAllocPages(dataSize)
 	if newBase == nil {
 		return
