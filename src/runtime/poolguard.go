@@ -230,13 +230,14 @@ func poolGuardLookup(addr uintptr) *poolGuardPage {
 // If the backing array is already one of our mmap regions: unprotect it
 // so the caller can read/write normally.
 //
-// If it is a plain heap allocation: migrate it to a fresh mmap region now,
+// If it is a plain heap allocation AND large enough to benefit from page
+// isolation (>= physPageSize): migrate it to a fresh mmap region now,
 // updating hdrData so the caller's pointer is redirected.  Any aliases the
 // caller creates between Get and Put will then point into the mmap region.
-// When Put calls poolGuardPutBacking, it just mprotects those pages — the
-// old heap address is never needed again.  This is the fix for the
-// yoloString/TSDB pattern: without this migration, aliases would forever
-// point to the original heap allocation rather than to the guarded pages.
+// When Put calls poolGuardPutBacking, it just mprotects those pages.
+//
+// Small backing arrays (< physPageSize) are skipped to avoid migrating
+// internal library pools (regexp, fmt, etc.) that operate on small buffers.
 func poolGuardGetBacking(hdrData *unsafe.Pointer, hdrCap int, elemSize uintptr) {
 	if *hdrData == nil || hdrCap == 0 || elemSize == 0 {
 		return
@@ -259,6 +260,12 @@ func poolGuardGetBacking(hdrData *unsafe.Pointer, hdrCap int, elemSize uintptr) 
 		return
 	}
 	dataSize := uintptr(hdrCap) * elemSize
+	// Skip small backing arrays to avoid migrating internal library pools
+	// (regexp, fmt, connect, etc.) that use sub-page buffers.  The TSDB
+	// bufferpool and similar use-case buffers are always large (≥ 64 KiB).
+	if dataSize < physPageSize {
+		return
+	}
 	newBase := poolGuardAllocPages(dataSize)
 	if newBase == nil {
 		return
