@@ -178,21 +178,22 @@ func race_PoolUnquarantine(ptr unsafe.Pointer, size uintptr) {
 }
 
 // racePoolQuarantine calls into TSan to mark the range as quarantined.
-// Requires __tsan_go_pool_quarantine in the TSan .syso; currently a no-op
-// stub until the TSan library is updated.
+// Uses the FreedMarker/FreedInfo pattern so any access before Unquarantine
+// triggers a use-after-pool-put report (including same-goroutine accesses).
 //
 //go:nosplit
 func racePoolQuarantine(ptr unsafe.Pointer, size uintptr) {
-	// TODO: racecall(&__tsan_go_pool_quarantine, uintptr(ptr), size, 0, 0)
+	gp := getg()
+	racecall(&__tsan_go_pool_quarantine, gp.racectx, 0, uintptr(ptr), size)
 }
 
-// racePoolUnquarantine calls into TSan to clear the quarantine mark.
-// Requires __tsan_go_pool_unquarantine in the TSan .syso; currently a no-op
-// stub until the TSan library is updated.
+// racePoolUnquarantine calls into TSan to reset shadow for the range,
+// allowing the caller from Pool.Get to use the object without false positives.
 //
 //go:nosplit
 func racePoolUnquarantine(ptr unsafe.Pointer, size uintptr) {
-	// TODO: racecall(&__tsan_go_pool_unquarantine, uintptr(ptr), size, 0, 0)
+	gp := getg()
+	racecall(&__tsan_go_pool_unquarantine, gp.racectx, 0, uintptr(ptr), size)
 }
 
 // Private interface for the runtime.
@@ -414,17 +415,14 @@ var __tsan_go_ignore_sync_end byte
 //go:linkname __tsan_report_count __tsan_report_count
 var __tsan_report_count byte
 
-// Pool quarantine symbols — implemented in TSan via __tsan_go_pool_quarantine
-// and __tsan_go_pool_unquarantine. Declarations are present so that the
-// racePoolQuarantine/racePoolUnquarantine stubs can be wired up once the
-// TSan .syso files are rebuilt with those symbols.
+// Pool quarantine symbols — implemented in the TSan .syso via
+// __tsan_go_pool_quarantine and __tsan_go_pool_unquarantine.
 //
-// TODO(pool-quarantine): uncomment after updating TSan .syso:
-// //go:linkname __tsan_go_pool_quarantine __tsan_go_pool_quarantine
-// var __tsan_go_pool_quarantine byte
-//
-// //go:linkname __tsan_go_pool_unquarantine __tsan_go_pool_unquarantine
-// var __tsan_go_pool_unquarantine byte
+//go:linkname __tsan_go_pool_quarantine __tsan_go_pool_quarantine
+var __tsan_go_pool_quarantine byte
+
+//go:linkname __tsan_go_pool_unquarantine __tsan_go_pool_unquarantine
+var __tsan_go_pool_unquarantine byte
 
 // Mimic what cmd/cgo would do.
 //
@@ -445,9 +443,8 @@ var __tsan_report_count byte
 //go:cgo_import_static __tsan_go_ignore_sync_begin
 //go:cgo_import_static __tsan_go_ignore_sync_end
 //go:cgo_import_static __tsan_report_count
-// TODO(pool-quarantine): after updating TSan .syso:
-// //go:cgo_import_static __tsan_go_pool_quarantine
-// //go:cgo_import_static __tsan_go_pool_unquarantine
+//go:cgo_import_static __tsan_go_pool_quarantine
+//go:cgo_import_static __tsan_go_pool_unquarantine
 
 // These are called from race_amd64.s.
 //

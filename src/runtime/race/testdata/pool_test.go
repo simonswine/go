@@ -47,10 +47,9 @@ func TestNoRacePool(t *testing.T) {
 	}
 }
 
-// TestRaceFailingPoolPutUseSameGoroutine checks that a write to a pool object
+// TestRacePoolPutUseSameGoroutine checks that a write to a pool object
 // after Put in the same goroutine is detected as use-after-pool-put.
-// Marked Failing because quarantine detection requires a TSan .syso update.
-func TestRaceFailingPoolPutUseSameGoroutine(t *testing.T) {
+func TestRacePoolPutUseSameGoroutine(t *testing.T) {
 	p := &sync.Pool{New: func() any { return new(bytes.Buffer) }}
 	for i := 0; i < 10; i++ {
 		buf := p.Get().(*bytes.Buffer)
@@ -60,10 +59,9 @@ func TestRaceFailingPoolPutUseSameGoroutine(t *testing.T) {
 	}
 }
 
-// TestRaceFailingPoolPutUseCrossGoroutine checks that a cross-goroutine write
+// TestRacePoolPutUseCrossGoroutine checks that a cross-goroutine write
 // to a pool object after Put is detected.
-// Marked Failing because quarantine detection requires a TSan .syso update.
-func TestRaceFailingPoolPutUseCrossGoroutine(t *testing.T) {
+func TestRacePoolPutUseCrossGoroutine(t *testing.T) {
 	p := &sync.Pool{New: func() any { return new(bytes.Buffer) }}
 	for i := 0; i < 10; i++ {
 		buf := p.Get().(*bytes.Buffer)
