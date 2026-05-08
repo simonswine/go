@@ -31,3 +31,7 @@ type EpollEvent struct {
 	pad_cgo_0 [4]byte
 	Data      uint64
 }
+
+const (
+	SYS_IOCTL = 4054
+)

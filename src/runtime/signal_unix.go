@@ -934,6 +934,12 @@ func sigpanic() {
 		if gp.paniconfault {
 			panicmemAddr(gp.sigcode1)
 		}
+		// Check for pool guard violation (GODEBUG=poolguard=1, mprotect path).
+		if debug.poolguard != 0 {
+			if r := poolGuardFind(gp.sigcode1); r != nil {
+				poolGuardReport(r, gp.sigcode1)
+			}
+		}
 		if inUserArenaChunk(gp.sigcode1) {
 			// We could check that the arena chunk is explicitly set to fault,
 			// but the fact that we faulted on accessing it is enough to prove

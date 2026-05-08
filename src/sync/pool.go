@@ -83,6 +83,28 @@ type poolLocal struct {
 //go:linkname runtime_randn runtime.randn
 func runtime_randn(n uint32) uint32
 
+// runtime_inHeap reports whether addr points into the Go heap. Used to guard
+// slice-field quarantine against SRODATA, stack, or other non-heap addresses
+// that would produce false-positive "use after Pool.Put" reports.
+//
+//go:linkname runtime_inHeap
+func runtime_inHeap(addr uintptr) bool
+
+// runtime_poolGuardEnabled reports whether GODEBUG=poolguard=1 is active.
+//
+//go:linkname runtime_poolGuardEnabled
+func runtime_poolGuardEnabled() bool
+
+// runtime_poolGuardPut is called on Pool.Put when poolguard is active.
+// typPtr and dataPtr are the raw interface words of the item.
+//
+//go:linkname runtime_poolGuardPut
+func runtime_poolGuardPut(typPtr, dataPtr unsafe.Pointer)
+
+// runtime_poolGuardGet is called on Pool.Get when poolguard is active.
+//
+//go:linkname runtime_poolGuardGet
+func runtime_poolGuardGet(typPtr, dataPtr unsafe.Pointer)
 var poolRaceHash [128]uint64
 
 // poolRaceAddr returns an address to use as the synchronization point
@@ -119,6 +141,13 @@ func (p *Pool) Put(x any) {
 	if race.Enabled {
 		race.Enable()
 	}
+	// poolguard: hardware-enforce use-after-Put detection via mmap+fault.
+	// Called after the item is stored so that we move the item's slice
+	// backing arrays to guarded pages while the pool holds the reference.
+	if runtime_poolGuardEnabled() {
+		words := (*[2]unsafe.Pointer)(unsafe.Pointer(&x))
+		runtime_poolGuardPut(words[0], words[1])
+	}
 }
 
 // Get selects an arbitrary item from the [Pool], removes it from the
@@ -151,6 +180,11 @@ func (p *Pool) Get() any {
 		if x != nil {
 			race.Acquire(poolRaceAddr(x))
 		}
+	}
+	// poolguard: unprotect the item's guarded pages before returning it.
+	if runtime_poolGuardEnabled() && x != nil {
+		words := (*[2]unsafe.Pointer)(unsafe.Pointer(&x))
+		runtime_poolGuardGet(words[0], words[1])
 	}
 	if x == nil && p.New != nil {
 		x = p.New()
