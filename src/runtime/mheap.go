@@ -655,6 +655,17 @@ func inheap(b uintptr) bool {
 	return spanOfHeap(b) != nil
 }
 
+// sync_runtime_inHeap reports whether addr points into the Go heap.
+// Used by sync.Pool to skip quarantine of non-heap slice backing arrays
+// (e.g. SRODATA buffers in protobuf descriptors) that would otherwise
+// produce false-positive "use after Pool.Put" reports.
+//
+//go:linkname sync_runtime_inHeap sync.runtime_inHeap
+//go:nosplit
+func sync_runtime_inHeap(addr uintptr) bool {
+	return inheap(addr)
+}
+
 // inHeapOrStack is a variant of inheap that returns true for pointers
 // into any allocated heap span.
 //

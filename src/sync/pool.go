@@ -84,6 +84,13 @@ type poolLocal struct {
 //go:linkname runtime_randn runtime.randn
 func runtime_randn(n uint32) uint32
 
+// runtime_inHeap reports whether addr points into the Go heap. Used to guard
+// slice-field quarantine against SRODATA, stack, or other non-heap addresses
+// that would produce false-positive "use after Pool.Put" reports.
+//
+//go:linkname runtime_inHeap
+func runtime_inHeap(addr uintptr) bool
+
 var poolRaceHash [128]uint64
 
 // poolRaceAddr returns an address to use as the synchronization point
@@ -97,59 +104,158 @@ func poolRaceAddr(x any) unsafe.Pointer {
 	return unsafe.Pointer(&poolRaceHash[h%uint32(len(poolRaceHash))])
 }
 
-// poolObjectPtrSize returns the data pointer and size to quarantine for a pool
-// item.
-//
-//   - *T (pointer): returns the pointer value and sizeof(T), quarantining the
-//     pointed-to heap object.
-//   - []E (slice): returns the backing-array pointer and cap*sizeof(E),
-//     quarantining the entire allocated capacity of the slice. This catches
-//     use-after-put bugs where string or byte aliases into the backing array
-//     are read after the buffer has been returned to the pool and re-issued
-//     to another goroutine (the Pyroscope/yoloString pattern).
-//
-// Returns (nil, 0) for nil, non-pointer/non-slice, or zero-size values.
-func poolObjectPtrSize(x any) (unsafe.Pointer, uintptr) {
+// sliceHeader mirrors the runtime slice header. Using unsafe.Pointer for Data
+// avoids checkptr complaints about uintptr-to-pointer conversions.
+type sliceHeader struct {
+	Data unsafe.Pointer
+	Len  int
+	Cap  int
+}
+
+// poolQuarantineAll quarantines a pool item and, for pointer types, the
+// backing arrays of any slice fields within the pointed-to struct (recursively).
+// This catches the Pyroscope/yoloString pattern where a *Buffer struct is Put
+// back to the pool while callers still hold string aliases into buf.B's
+// backing array: quarantining the backing array directly ensures any subsequent
+// read of those aliases fires a use-after-pool-put report.
+func poolQuarantineAll(x any) {
 	if x == nil {
-		return nil, 0
+		return
 	}
-	// Interface layout: [type *abi.Type, data unsafe.Pointer].
 	words := (*[2]unsafe.Pointer)(unsafe.Pointer(&x))
 	typ := (*abi.Type)(words[0])
 	switch typ.Kind() {
 	case abi.Pointer:
-		// Data word IS the pointer for direct-iface types.
 		ptr := words[1]
 		if ptr == nil {
-			return nil, 0
+			return
 		}
-		size := (*abi.PtrType)(unsafe.Pointer(typ)).Elem.Size_
-		if size == 0 {
-			return nil, 0
+		elemTyp := (*abi.PtrType)(unsafe.Pointer(typ)).Elem
+		if elemTyp.Size_ == 0 {
+			return
 		}
-		return ptr, size
+		race.PoolQuarantine(ptr, elemTyp.Size_)
+		if elemTyp.Kind() == abi.Struct {
+			poolReleaseSliceFields(ptr, elemTyp)
+		}
 	case abi.Slice:
-		// Data word is a pointer to the slice header {Data, Len, Cap}.
-		// We use a struct with unsafe.Pointer for the data field so that
-		// checkptr does not flag the extraction as invalid uintptr arithmetic.
 		if words[1] == nil {
-			return nil, 0
-		}
-		type sliceHeader struct {
-			Data unsafe.Pointer
-			Len  int
-			Cap  int
+			return
 		}
 		hdr := (*sliceHeader)(words[1])
-		data := hdr.Data
-		capElems := hdr.Cap
-		elemSize := (*abi.SliceType)(unsafe.Pointer(typ)).Elem.Size_
-		if data == nil || capElems == 0 || elemSize == 0 {
-			return nil, 0
+		if hdr.Data == nil || hdr.Cap == 0 {
+			return
 		}
-		return data, uintptr(capElems) * elemSize
+		elemSize := (*abi.SliceType)(unsafe.Pointer(typ)).Elem.Size_
+		if elemSize == 0 {
+			return
+		}
+		race.PoolQuarantine(hdr.Data, uintptr(hdr.Cap)*elemSize)
 	}
-	return nil, 0
+}
+
+// poolUnquarantineAll clears quarantine for a pool item and acquires the
+// slice-field synchronization edges released by the putter via
+// poolReleaseSliceFields, so that the getter's subsequent writes to the
+// backing arrays are properly ordered relative to the putter's release.
+func poolUnquarantineAll(x any) {
+	if x == nil {
+		return
+	}
+	words := (*[2]unsafe.Pointer)(unsafe.Pointer(&x))
+	typ := (*abi.Type)(words[0])
+	switch typ.Kind() {
+	case abi.Pointer:
+		ptr := words[1]
+		if ptr == nil {
+			return
+		}
+		elemTyp := (*abi.PtrType)(unsafe.Pointer(typ)).Elem
+		if elemTyp.Size_ == 0 {
+			return
+		}
+		race.PoolUnquarantine(ptr, elemTyp.Size_)
+		if elemTyp.Kind() == abi.Struct {
+			poolAcquireSliceFields(ptr, elemTyp)
+		}
+	case abi.Slice:
+		if words[1] == nil {
+			return
+		}
+		hdr := (*sliceHeader)(words[1])
+		if hdr.Data == nil || hdr.Cap == 0 {
+			return
+		}
+		elemSize := (*abi.SliceType)(unsafe.Pointer(typ)).Elem.Size_
+		if elemSize == 0 {
+			return
+		}
+		race.PoolUnquarantine(hdr.Data, uintptr(hdr.Cap)*elemSize)
+	}
+}
+
+// poolReleaseSliceFields walks the fields of the struct pointed to by base
+// (described by typ) and calls race.Release on the backing-array address of
+// every heap-allocated slice field. Nested struct fields are recursed into.
+//
+// On Pool.Put this establishes a happens-before edge between the putter and
+// any goroutine that later calls Pool.Get and acquires the same edge via
+// poolAcquireSliceFields. That goroutine's subsequent writes to the backing
+// array will then race against any concurrent reader holding a string alias
+// into the same array (the Pyroscope/yoloString pattern), while same-goroutine
+// reads by the putter itself do not fire false positives.
+func poolReleaseSliceFields(base unsafe.Pointer, typ *abi.Type) {
+	st := typ.StructType()
+	if st == nil {
+		return
+	}
+	for i := range st.Fields {
+		f := &st.Fields[i]
+		fieldPtr := unsafe.Pointer(uintptr(base) + f.Offset)
+		switch f.Typ.Kind() {
+		case abi.Slice:
+			hdr := (*sliceHeader)(fieldPtr)
+			if hdr.Data == nil {
+				continue
+			}
+			// Only release on heap-allocated backing arrays.
+			if !runtime_inHeap(uintptr(hdr.Data)) {
+				continue
+			}
+			race.Release(hdr.Data)
+		case abi.Struct:
+			poolReleaseSliceFields(fieldPtr, f.Typ)
+		}
+	}
+}
+
+// poolAcquireSliceFields mirrors poolReleaseSliceFields: on Pool.Get it
+// acquires the happens-before edge released by the putter. Any subsequent
+// write by the getter to the backing array will then be visible to TSan as
+// a potential concurrent write against readers that hold string aliases but
+// did not go through the pool synchronization.
+func poolAcquireSliceFields(base unsafe.Pointer, typ *abi.Type) {
+	st := typ.StructType()
+	if st == nil {
+		return
+	}
+	for i := range st.Fields {
+		f := &st.Fields[i]
+		fieldPtr := unsafe.Pointer(uintptr(base) + f.Offset)
+		switch f.Typ.Kind() {
+		case abi.Slice:
+			hdr := (*sliceHeader)(fieldPtr)
+			if hdr.Data == nil {
+				continue
+			}
+			if !runtime_inHeap(uintptr(hdr.Data)) {
+				continue
+			}
+			race.Acquire(hdr.Data)
+		case abi.Struct:
+			poolAcquireSliceFields(fieldPtr, f.Typ)
+		}
+	}
 }
 
 // Put adds x to the pool.
@@ -174,9 +280,7 @@ func (p *Pool) Put(x any) {
 	runtime_procUnpin()
 	if race.Enabled {
 		race.Enable()
-		if ptr, size := poolObjectPtrSize(x); ptr != nil {
-			race.PoolQuarantine(ptr, size)
-		}
+		poolQuarantineAll(x)
 	}
 }
 
@@ -209,9 +313,7 @@ func (p *Pool) Get() any {
 		race.Enable()
 		if x != nil {
 			race.Acquire(poolRaceAddr(x))
-			if ptr, size := poolObjectPtrSize(x); ptr != nil {
-				race.PoolUnquarantine(ptr, size)
-			}
+			poolUnquarantineAll(x)
 		}
 	}
 	if x == nil && p.New != nil {
