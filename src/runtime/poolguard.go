@@ -25,18 +25,32 @@ import (
 	"unsafe"
 )
 
-// poolGuardSuppressPatterns holds package-path prefixes parsed from
-// the POOLGUARD_SUPPRESS environment variable.  A Pool.Put whose call
-// stack contains any frame whose fully-qualified function name starts
-// with one of these prefixes is silently skipped.
-//
-// Example:  POOLGUARD_SUPPRESS=net/http,google.golang.org/protobuf
-//
+// poolGuardSuppressPattern describes one entry from POOLGUARD_SUPPRESS.
+type poolGuardSuppressPattern struct {
+	pat         string // pattern to match
+	directOnly  bool   // if true, match only the direct Pool.Put caller
+}
+
+// poolGuardSuppressPatterns holds patterns parsed from POOLGUARD_SUPPRESS.
 // Entries are immutable after init.
-var poolGuardSuppressPatterns []string
+var poolGuardSuppressPatterns []poolGuardSuppressPattern
 
 // poolGuardInitSuppressPatterns parses the POOLGUARD_SUPPRESS env var.
-// Called from init() once GODEBUG=poolguard=1 is confirmed.
+//
+// Two pattern forms are supported:
+//
+//	net/http                     prefix match — suppress any Put whose call
+//	                             stack contains a frame whose function name
+//	                             starts with "net/http" (broad).
+//
+//	=net/http.putBufioWriter     direct-caller match — suppress only when
+//	                             the function that directly calls Pool.Put
+//	                             starts with "net/http.putBufioWriter" (precise).
+//
+// The two forms compose: use package prefixes for convenience or full
+// function names for exactness:
+//
+//	POOLGUARD_SUPPRESS==fmt.(*pp).free,=net/http.putBufioWriter
 func poolGuardInitSuppressPatterns() {
 	env := gogetenv("POOLGUARD_SUPPRESS")
 	if env == "" {
@@ -46,7 +60,14 @@ func poolGuardInitSuppressPatterns() {
 	for i := 0; i <= len(env); i++ {
 		if i == len(env) || env[i] == ',' {
 			if i > start {
-				poolGuardSuppressPatterns = append(poolGuardSuppressPatterns, env[start:i])
+				raw := env[start:i]
+				if len(raw) > 0 && raw[0] == '=' {
+					poolGuardSuppressPatterns = append(poolGuardSuppressPatterns,
+						poolGuardSuppressPattern{pat: raw[1:], directOnly: true})
+				} else {
+					poolGuardSuppressPatterns = append(poolGuardSuppressPatterns,
+						poolGuardSuppressPattern{pat: raw, directOnly: false})
+				}
 			}
 			start = i + 1
 		}
@@ -58,23 +79,46 @@ func poolGuardHasPrefix(s, prefix string) bool {
 	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }
 
-// poolGuardSuppressed reports whether any frame in pcs belongs to a
-// package that has been suppressed via POOLGUARD_SUPPRESS.
+// poolGuardSuppressed reports whether the Put call stack represented by pcs
+// should be suppressed.
+//
+// pcs[0] is always sync.(*Pool).Put; pcs[1] is the direct Pool.Put caller.
+// "="-prefixed patterns match only pcs[1]; plain patterns match any frame.
 func poolGuardSuppressed(pcs []uintptr) bool {
-	if len(poolGuardSuppressPatterns) == 0 {
+	if len(poolGuardSuppressPatterns) == 0 || len(pcs) == 0 {
 		return false
 	}
-	for _, pc := range pcs {
-		if pc == 0 {
-			break
-		}
-		f := findfunc(pc)
-		if !f.valid() {
+
+	// Pre-compute the direct-caller name (pcs[1]) only if needed.
+	directName := ""
+	for _, sp := range poolGuardSuppressPatterns {
+		if !sp.directOnly {
 			continue
 		}
-		name := funcname(f)
-		for _, pat := range poolGuardSuppressPatterns {
-			if poolGuardHasPrefix(name, pat) {
+		if directName == "" && len(pcs) > 1 && pcs[1] != 0 {
+			if f := findfunc(pcs[1]); f.valid() {
+				directName = funcname(f)
+			}
+		}
+		if directName != "" && poolGuardHasPrefix(directName, sp.pat) {
+			return true
+		}
+	}
+
+	// Check any-frame patterns.
+	for _, sp := range poolGuardSuppressPatterns {
+		if sp.directOnly {
+			continue
+		}
+		for _, pc := range pcs {
+			if pc == 0 {
+				break
+			}
+			f := findfunc(pc)
+			if !f.valid() {
+				continue
+			}
+			if poolGuardHasPrefix(funcname(f), sp.pat) {
 				return true
 			}
 		}
