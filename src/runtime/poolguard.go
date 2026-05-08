@@ -25,6 +25,63 @@ import (
 	"unsafe"
 )
 
+// poolGuardSuppressPatterns holds package-path prefixes parsed from
+// the POOLGUARD_SUPPRESS environment variable.  A Pool.Put whose call
+// stack contains any frame whose fully-qualified function name starts
+// with one of these prefixes is silently skipped.
+//
+// Example:  POOLGUARD_SUPPRESS=net/http,google.golang.org/protobuf
+//
+// Entries are immutable after init.
+var poolGuardSuppressPatterns []string
+
+// poolGuardInitSuppressPatterns parses the POOLGUARD_SUPPRESS env var.
+// Called from init() once GODEBUG=poolguard=1 is confirmed.
+func poolGuardInitSuppressPatterns() {
+	env := gogetenv("POOLGUARD_SUPPRESS")
+	if env == "" {
+		return
+	}
+	start := 0
+	for i := 0; i <= len(env); i++ {
+		if i == len(env) || env[i] == ',' {
+			if i > start {
+				poolGuardSuppressPatterns = append(poolGuardSuppressPatterns, env[start:i])
+			}
+			start = i + 1
+		}
+	}
+}
+
+// poolGuardHasPrefix reports whether s starts with prefix.
+func poolGuardHasPrefix(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+
+// poolGuardSuppressed reports whether any frame in pcs belongs to a
+// package that has been suppressed via POOLGUARD_SUPPRESS.
+func poolGuardSuppressed(pcs []uintptr) bool {
+	if len(poolGuardSuppressPatterns) == 0 {
+		return false
+	}
+	for _, pc := range pcs {
+		if pc == 0 {
+			break
+		}
+		f := findfunc(pc)
+		if !f.valid() {
+			continue
+		}
+		name := funcname(f)
+		for _, pat := range poolGuardSuppressPatterns {
+			if poolGuardHasPrefix(name, pat) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // poolGuardPage tracks one mmap-backed guarded region.
 // Entries are added on first Put of a pool item and never removed;
 // the same entry is reused on subsequent Put/Get cycles.
@@ -133,6 +190,17 @@ func poolGuardPutBacking(hdrData *unsafe.Pointer, hdrCap int, elemSize uintptr) 
 	}
 	dataSize := uintptr(hdrCap) * elemSize
 
+	// Capture the Put call stack before any other work so the suppression
+	// check and the error report both use the same frames.
+	var putPCs [16]uintptr
+	nPCs := callers(4, putPCs[:])
+
+	// Check whether the caller's package is on the suppression list.
+	// If so, skip protection silently (the pattern is known-safe).
+	if poolGuardSuppressed(putPCs[:nPCs]) {
+		return
+	}
+
 	// Check whether this backing array is already one of our mmap regions.
 	r := poolGuardLookup(orig)
 	if r == nil {
@@ -148,8 +216,8 @@ func poolGuardPutBacking(hdrData *unsafe.Pointer, hdrCap int, elemSize uintptr) 
 		*hdrData = newBase
 	}
 
-	// Capture the Put call stack.
-	r.nPCs = callers(4, r.putPCs[:])
+	// Store the Put call stack for the fault report.
+	r.nPCs = copy(r.putPCs[:], putPCs[:nPCs])
 	r.protected = true
 
 	// Delegate to platform-specific protection (mprotect or userfaultfd).
@@ -284,4 +352,10 @@ func sync_poolGuardGet(typPtr, dataPtr unsafe.Pointer) {
 //go:nosplit
 func sync_poolGuardEnabled() bool {
 	return debug.poolguard != 0
+}
+
+func init() {
+	if debug.poolguard != 0 {
+		poolGuardInitSuppressPatterns()
+	}
 }
