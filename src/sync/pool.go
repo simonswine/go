@@ -181,13 +181,21 @@ func (p *Pool) Get() any {
 			race.Acquire(poolRaceAddr(x))
 		}
 	}
-	// poolguard: unprotect the item's guarded pages before returning it.
+	// poolguard: migrate or unprotect the item's guarded pages.
+	// Run before p.New so pool-returned items are handled; run again after
+	// p.New so freshly-allocated items are also migrated to mmap pages.
+	// After this call any aliases the caller creates will point to the
+	// guarded mmap region rather than to the original heap allocation.
 	if runtime_poolGuardEnabled() && x != nil {
 		words := (*[2]unsafe.Pointer)(unsafe.Pointer(&x))
 		runtime_poolGuardGet(words[0], words[1])
 	}
 	if x == nil && p.New != nil {
 		x = p.New()
+		if runtime_poolGuardEnabled() && x != nil {
+			words := (*[2]unsafe.Pointer)(unsafe.Pointer(&x))
+			runtime_poolGuardGet(words[0], words[1])
+		}
 	}
 	return x
 }

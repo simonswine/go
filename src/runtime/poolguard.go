@@ -224,9 +224,57 @@ func poolGuardLookup(addr uintptr) *poolGuardPage {
 	return nil
 }
 
-// poolGuardPutBacking is the platform-independent part of protecting a single
-// slice backing array.  It moves the data to mmap pages (if not already), then
-// calls the platform-specific protection function.
+// poolGuardGetBacking ensures the slice field at hdrData is backed by
+// page-isolated mmap memory before the caller uses the pool item.
+//
+// If the backing array is already one of our mmap regions: unprotect it
+// so the caller can read/write normally.
+//
+// If it is a plain heap allocation: migrate it to a fresh mmap region now,
+// updating hdrData so the caller's pointer is redirected.  Any aliases the
+// caller creates between Get and Put will then point into the mmap region.
+// When Put calls poolGuardPutBacking, it just mprotects those pages — the
+// old heap address is never needed again.  This is the fix for the
+// yoloString/TSDB pattern: without this migration, aliases would forever
+// point to the original heap allocation rather than to the guarded pages.
+func poolGuardGetBacking(hdrData *unsafe.Pointer, hdrCap int, elemSize uintptr) {
+	if *hdrData == nil || hdrCap == 0 || elemSize == 0 {
+		return
+	}
+	orig := uintptr(*hdrData)
+
+	r := poolGuardLookup(orig)
+	if r != nil {
+		// Already mmap-backed.  Unprotect so the caller can use it.
+		if r.protected {
+			r.protected = false
+			poolGuardUnprotect(unsafe.Pointer(r.base), r.size)
+		}
+		return
+	}
+
+	// Not yet mmap-backed.  Migrate to a fresh mmap region.
+	// Skip non-heap addresses (SRODATA, stacks, etc.)
+	if !inheap(orig) {
+		return
+	}
+	dataSize := uintptr(hdrCap) * elemSize
+	newBase := poolGuardAllocPages(dataSize)
+	if newBase == nil {
+		return
+	}
+	memmove(newBase, *hdrData, dataSize)
+	pageSize := (dataSize + physPageSize - 1) &^ (physPageSize - 1)
+	poolGuardAddKnown(uintptr(newBase), pageSize)
+	// Redirect the slice header so the caller and all future aliases it
+	// creates point into the guarded mmap region.
+	*hdrData = newBase
+}
+
+// poolGuardPutBacking protects the mmap-backed slice field at hdrData.
+// By the time Put is called, the backing array must already be mmap-backed
+// (set up by poolGuardGetBacking on the preceding Get call).  If not — e.g.
+// a freshly-allocated item is Put without a prior Get — migrate it first.
 func poolGuardPutBacking(hdrData *unsafe.Pointer, hdrCap int, elemSize uintptr) {
 	orig := uintptr(*hdrData)
 	if orig == 0 || hdrCap == 0 || elemSize == 0 {
@@ -240,23 +288,25 @@ func poolGuardPutBacking(hdrData *unsafe.Pointer, hdrCap int, elemSize uintptr) 
 	nPCs := callers(4, putPCs[:])
 
 	// Check whether the caller's package is on the suppression list.
-	// If so, skip protection silently (the pattern is known-safe).
 	if poolGuardSuppressed(putPCs[:nPCs]) {
 		return
 	}
 
-	// Check whether this backing array is already one of our mmap regions.
 	r := poolGuardLookup(orig)
 	if r == nil {
-		// First time: allocate mmap pages and copy data there.
+		// Not yet mmap-backed (Put without a prior Get, e.g. a freshly
+		// allocated item).  Migrate to mmap now so we can protect it.
+		// Only skip addresses that are neither Go heap nor our own mmap.
+		if !inheap(orig) {
+			return // SRODATA, stack, or other non-heap non-mmap address
+		}
 		newBase := poolGuardAllocPages(dataSize)
 		if newBase == nil {
-			return // allocation failure, skip guarding
+			return
 		}
 		memmove(newBase, *hdrData, dataSize)
 		pageSize := (dataSize + physPageSize - 1) &^ (physPageSize - 1)
 		r = poolGuardAddKnown(uintptr(newBase), pageSize)
-		// Update the caller's slice header to point at the new pages.
 		*hdrData = newBase
 	}
 
@@ -266,19 +316,6 @@ func poolGuardPutBacking(hdrData *unsafe.Pointer, hdrCap int, elemSize uintptr) 
 
 	// Delegate to platform-specific protection (mprotect or userfaultfd).
 	poolGuardProtect(unsafe.Pointer(r.base), r.size, r)
-}
-
-// poolGuardGetBacking unprotects the mmap pages for a backing array.
-func poolGuardGetBacking(data unsafe.Pointer) {
-	if data == nil {
-		return
-	}
-	r := poolGuardLookup(uintptr(data))
-	if r == nil || !r.protected {
-		return
-	}
-	r.protected = false
-	poolGuardUnprotect(unsafe.Pointer(r.base), r.size)
 }
 
 // sliceHeader mirrors the slice header layout.  Used to read/write Data
@@ -305,8 +342,11 @@ func poolGuardPutSliceFields(base unsafe.Pointer, typ *abi.Type) {
 			if hdr.Data == nil || hdr.Cap == 0 {
 				continue
 			}
-			if !inheap(uintptr(hdr.Data)) {
-				// Non-heap backing array (SRODATA etc.) — skip.
+			// Accept our own mmap-backed pages (not in Go heap) as well as
+			// regular heap allocations.  Only skip truly non-addressable
+			// regions (SRODATA etc.) that are neither heap nor our own mmap.
+			data := uintptr(hdr.Data)
+			if !inheap(data) && poolGuardLookup(data) == nil {
 				continue
 			}
 			elemSize := (*abi.SliceType)(unsafe.Pointer(f.Typ)).Elem.Size_
@@ -320,7 +360,7 @@ func poolGuardPutSliceFields(base unsafe.Pointer, typ *abi.Type) {
 	}
 }
 
-// poolGuardGetSliceFields unprotects all slice backing arrays within base.
+// poolGuardGetSliceFields migrates or unprotects all slice backing arrays within base.
 func poolGuardGetSliceFields(base unsafe.Pointer, typ *abi.Type) {
 	st := typ.StructType()
 	if st == nil {
@@ -332,7 +372,14 @@ func poolGuardGetSliceFields(base unsafe.Pointer, typ *abi.Type) {
 		switch f.Typ.Kind() {
 		case abi.Slice:
 			hdr := (*pgSliceHeader)(fieldPtr)
-			poolGuardGetBacking(hdr.Data)
+			if hdr.Cap == 0 {
+				continue
+			}
+			elemSize := (*abi.SliceType)(unsafe.Pointer(f.Typ)).Elem.Size_
+			if elemSize == 0 {
+				continue
+			}
+			poolGuardGetBacking(&hdr.Data, hdr.Cap, elemSize)
 		case abi.Struct:
 			poolGuardGetSliceFields(fieldPtr, f.Typ)
 		}
@@ -371,6 +418,8 @@ func sync_poolGuardPut(typPtr, dataPtr unsafe.Pointer) {
 }
 
 // sync_poolGuardGet is called from sync.Pool.Get when GODEBUG=poolguard=1.
+// It migrates heap-backed slice fields to mmap pages (first call) or
+// unprotects already-mmap-backed pages (subsequent calls).
 //
 //go:linkname sync_poolGuardGet sync.runtime_poolGuardGet
 func sync_poolGuardGet(typPtr, dataPtr unsafe.Pointer) {
@@ -386,7 +435,14 @@ func sync_poolGuardGet(typPtr, dataPtr unsafe.Pointer) {
 			return
 		}
 		hdr := (*pgSliceHeader)(dataPtr)
-		poolGuardGetBacking(hdr.Data)
+		if hdr.Cap == 0 {
+			return
+		}
+		elemSize := (*abi.SliceType)(unsafe.Pointer(typ)).Elem.Size_
+		if elemSize == 0 {
+			return
+		}
+		poolGuardGetBacking(&hdr.Data, hdr.Cap, elemSize)
 	}
 }
 
