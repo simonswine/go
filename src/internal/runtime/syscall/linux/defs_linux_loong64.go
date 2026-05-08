@@ -29,3 +29,8 @@ type EpollEvent struct {
 	pad_cgo_0 [4]byte
 	Data      [8]byte // unaligned uintptr
 }
+
+const (
+	SYS_IOCTL = 29
+	SYS_USERFAULTFD = 282
+)

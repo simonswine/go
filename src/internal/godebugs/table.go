@@ -56,6 +56,7 @@ var All = []Info{
 	{Name: "netdns", Package: "net", Opaque: true},
 	{Name: "netedns0", Package: "net", Changed: 19, Old: "0"},
 	{Name: "panicnil", Package: "runtime", Changed: 21, Old: "1"},
+	{Name: "poolguard", Package: "runtime", Opaque: true},
 	{Name: "randautoseed", Package: "math/rand"},
 	{Name: "randseednop", Package: "math/rand", Changed: 24, Old: "0"},
 	{Name: "rsa1024min", Package: "crypto/rsa", Changed: 24, Old: "0"},

@@ -28,3 +28,8 @@ type EpollEvent struct {
 	Events uint32
 	Data   [8]byte // unaligned uintptr
 }
+
+const (
+	SYS_IOCTL = 16
+	SYS_USERFAULTFD = 323
+)

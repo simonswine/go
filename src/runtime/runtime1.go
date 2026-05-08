@@ -348,6 +348,10 @@ var debug struct {
 
 	panicnil atomic.Int32
 
+	// poolguard controls pool guard mode.
+	// 1 = enable use-after-Pool.Put detection via mmap+fault.
+	poolguard int32
+
 	// asynctimerchan controls whether timer channels
 	// behave asynchronously (as in Go 1.22 and earlier)
 	// instead of their Go 1.23+ synchronous behavior.
@@ -386,6 +390,7 @@ var dbgvars = []*dbgVar{
 	{name: "invalidptr", value: &debug.invalidptr},
 	{name: "madvdontneed", value: &debug.madvdontneed},
 	{name: "panicnil", atomic: &debug.panicnil},
+	{name: "poolguard", value: &debug.poolguard},
 	{name: "profstackdepth", value: &debug.profstackdepth, def: 128},
 	{name: "sbrk", value: &debug.sbrk},
 	{name: "scavtrace", value: &debug.scavtrace},

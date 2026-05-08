@@ -29,3 +29,7 @@ type EpollEvent struct {
 	_pad   uint32
 	Data   [8]byte // to match amd64
 }
+
+const (
+	SYS_IOCTL = 54
+)
