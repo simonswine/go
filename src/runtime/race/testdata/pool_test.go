@@ -96,3 +96,38 @@ func TestNoRacePoolNew(t *testing.T) {
 	buf.WriteByte('x')             // safe: fresh allocation, never Put
 	_ = buf
 }
+
+// sink prevents dead-store elimination for reads from aliased pooled memory.
+var sink byte
+
+// TestRacePoolSliceBackingArrayReuse detects use-after-Pool.Put via a slice
+// alias, the in-process analogue of the Pyroscope buffer-reuse bug where a
+// pooled []byte is read after it has been returned to the pool.
+//
+// Note: Go's race detector does not instrument reads through string headers
+// (strings are spec-immutable), so the test uses a []byte sub-slice alias.
+// In the Pyroscope yoloString pattern the race is the same but only the write
+// side of a concurrent reuse goroutine is directly detectable.
+func TestRacePoolSliceBackingArrayReuse(t *testing.T) {
+	p := &sync.Pool{New: func() any { return make([]byte, 8, 64) }}
+	for i := 0; i < 10; i++ {
+		buf := p.Get().([]byte)
+		buf[0] = byte(i)
+		alias := buf[:1] // sub-slice alias into same backing array
+		p.Put(buf)       // backing array quarantined here
+		sink = alias[0]  // BUG: read of backing array after Put
+	}
+}
+
+// TestNoRacePoolSliceCopied verifies that copying data before Put
+// produces no race — the equivalent of the strings.Clone fix.
+func TestNoRacePoolSliceCopied(t *testing.T) {
+	p := &sync.Pool{New: func() any { return make([]byte, 8, 64) }}
+	for i := 0; i < 10; i++ {
+		buf := p.Get().([]byte)
+		buf[0] = byte(i)
+		safe := buf[0] // copy value out before Put
+		p.Put(buf)
+		sink = safe // safe: independent copy, not aliased to buf
+	}
+}

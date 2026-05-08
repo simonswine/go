@@ -98,9 +98,17 @@ func poolRaceAddr(x any) unsafe.Pointer {
 }
 
 // poolObjectPtrSize returns the data pointer and size to quarantine for a pool
-// item. For pointer types (*T), it returns the pointer value and sizeof(T) so
-// that the pointed-to heap object is quarantined. Returns (nil, 0) for nil,
-// non-pointer, or zero-size values.
+// item.
+//
+//   - *T (pointer): returns the pointer value and sizeof(T), quarantining the
+//     pointed-to heap object.
+//   - []E (slice): returns the backing-array pointer and cap*sizeof(E),
+//     quarantining the entire allocated capacity of the slice. This catches
+//     use-after-put bugs where string or byte aliases into the backing array
+//     are read after the buffer has been returned to the pool and re-issued
+//     to another goroutine (the Pyroscope/yoloString pattern).
+//
+// Returns (nil, 0) for nil, non-pointer/non-slice, or zero-size values.
 func poolObjectPtrSize(x any) (unsafe.Pointer, uintptr) {
 	if x == nil {
 		return nil, 0
@@ -108,18 +116,40 @@ func poolObjectPtrSize(x any) (unsafe.Pointer, uintptr) {
 	// Interface layout: [type *abi.Type, data unsafe.Pointer].
 	words := (*[2]unsafe.Pointer)(unsafe.Pointer(&x))
 	typ := (*abi.Type)(words[0])
-	if typ.Kind() != abi.Pointer {
-		return nil, 0
+	switch typ.Kind() {
+	case abi.Pointer:
+		// Data word IS the pointer for direct-iface types.
+		ptr := words[1]
+		if ptr == nil {
+			return nil, 0
+		}
+		size := (*abi.PtrType)(unsafe.Pointer(typ)).Elem.Size_
+		if size == 0 {
+			return nil, 0
+		}
+		return ptr, size
+	case abi.Slice:
+		// Data word is a pointer to the slice header {Data, Len, Cap}.
+		// We use a struct with unsafe.Pointer for the data field so that
+		// checkptr does not flag the extraction as invalid uintptr arithmetic.
+		if words[1] == nil {
+			return nil, 0
+		}
+		type sliceHeader struct {
+			Data unsafe.Pointer
+			Len  int
+			Cap  int
+		}
+		hdr := (*sliceHeader)(words[1])
+		data := hdr.Data
+		capElems := hdr.Cap
+		elemSize := (*abi.SliceType)(unsafe.Pointer(typ)).Elem.Size_
+		if data == nil || capElems == 0 || elemSize == 0 {
+			return nil, 0
+		}
+		return data, uintptr(capElems) * elemSize
 	}
-	ptr := words[1] // for pointer types, the data word IS the pointer
-	if ptr == nil {
-		return nil, 0
-	}
-	size := (*abi.PtrType)(unsafe.Pointer(typ)).Elem.Size_
-	if size == 0 {
-		return nil, 0
-	}
-	return ptr, size
+	return nil, 0
 }
 
 // Put adds x to the pool.
