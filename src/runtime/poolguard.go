@@ -94,26 +94,47 @@ func poolGuardHasPrefix(s, prefix string) bool {
 // poolGuardSuppressed reports whether the Put call stack represented by pcs
 // should be suppressed.
 //
-// pcs[0] is always sync.(*Pool).Put; pcs[1] is the direct Pool.Put caller.
-// "="-prefixed patterns match only pcs[1]; plain patterns match any frame.
+// "="-prefixed patterns match only the direct Pool.Put caller.
+// Plain patterns match any frame in the stack.
+//
+// The direct Pool.Put caller sits at different indices depending on the code
+// path through poolguard:
+//   - *Struct pool (via poolGuardPutSliceFields): pcs[0]=sync.(*Pool).Put,
+//     pcs[1]=direct caller.
+//   - []byte pool (direct from sync_poolGuardPut): pcs[0]=direct caller,
+//     pcs[1]=caller's caller.
+//
+// For directOnly patterns we therefore check both pcs[0] and pcs[1]; the
+// pattern must start with the function name (not "sync.") to avoid
+// accidentally matching Pool.Put itself.
 func poolGuardSuppressed(pcs []uintptr) bool {
 	if len(poolGuardSuppressPatterns) == 0 || len(pcs) == 0 {
 		return false
 	}
 
-	// Pre-compute the direct-caller name (pcs[1]) only if needed.
-	directName := ""
+	// For "="-prefixed patterns: check the first two frames, taking whichever
+	// is not sync.(*Pool).Put (which is always in the chain but not the caller
+	// we care about for suppression purposes).
 	for _, sp := range poolGuardSuppressPatterns {
 		if !sp.directOnly {
 			continue
 		}
-		if directName == "" && len(pcs) > 1 && pcs[1] != 0 {
-			if f := findfunc(pcs[1]); f.valid() {
-				directName = funcname(f)
+		for i := 0; i < 2 && i < len(pcs); i++ {
+			if pcs[i] == 0 {
+				break
 			}
-		}
-		if directName != "" && poolGuardHasPrefix(directName, sp.pat) {
-			return true
+			f := findfunc(pcs[i])
+			if !f.valid() {
+				continue
+			}
+			name := funcname(f)
+			// Skip the Pool.Put frame itself.
+			if poolGuardHasPrefix(name, "sync.(*Pool).") {
+				continue
+			}
+			if poolGuardHasPrefix(name, sp.pat) {
+				return true
+			}
 		}
 	}
 
@@ -335,6 +356,14 @@ type pgSliceHeader struct {
 	Cap  int
 }
 
+// poolGuardCanMigrate reports whether a slice with the given element type can
+// safely be migrated to mmap pages.  Only slices whose elements contain no
+// Go pointers (PtrBytes == 0) are eligible: migrating pointer-containing
+// slices would hide those pointers from the GC, causing premature collection.
+func poolGuardCanMigrate(elemTyp *abi.Type) bool {
+	return elemTyp.PtrBytes == 0
+}
+
 // poolGuardPutSliceFields walks the struct at base (described by typ) and
 // calls poolGuardPutBacking for every heap-allocated []byte field.
 func poolGuardPutSliceFields(base unsafe.Pointer, typ *abi.Type) {
@@ -351,6 +380,10 @@ func poolGuardPutSliceFields(base unsafe.Pointer, typ *abi.Type) {
 			if hdr.Data == nil || hdr.Cap == 0 {
 				continue
 			}
+			sliceTyp := (*abi.SliceType)(unsafe.Pointer(f.Typ))
+			if !poolGuardCanMigrate(sliceTyp.Elem) {
+				continue // element type contains Go pointers — skip to preserve GC safety
+			}
 			// Accept our own mmap-backed pages (not in Go heap) as well as
 			// regular heap allocations.  Only skip truly non-addressable
 			// regions (SRODATA etc.) that are neither heap nor our own mmap.
@@ -358,7 +391,7 @@ func poolGuardPutSliceFields(base unsafe.Pointer, typ *abi.Type) {
 			if !inheap(data) && poolGuardLookup(data) == nil {
 				continue
 			}
-			elemSize := (*abi.SliceType)(unsafe.Pointer(f.Typ)).Elem.Size_
+			elemSize := sliceTyp.Elem.Size_
 			if elemSize == 0 {
 				continue
 			}
@@ -384,7 +417,11 @@ func poolGuardGetSliceFields(base unsafe.Pointer, typ *abi.Type) {
 			if hdr.Cap == 0 {
 				continue
 			}
-			elemSize := (*abi.SliceType)(unsafe.Pointer(f.Typ)).Elem.Size_
+			sliceTyp := (*abi.SliceType)(unsafe.Pointer(f.Typ))
+			if !poolGuardCanMigrate(sliceTyp.Elem) {
+				continue
+			}
+			elemSize := sliceTyp.Elem.Size_
 			if elemSize == 0 {
 				continue
 			}
@@ -415,7 +452,11 @@ func sync_poolGuardPut(typPtr, dataPtr unsafe.Pointer) {
 		if hdr.Data == nil || hdr.Cap == 0 {
 			return
 		}
-		elemSize := (*abi.SliceType)(unsafe.Pointer(typ)).Elem.Size_
+		sliceTyp := (*abi.SliceType)(unsafe.Pointer(typ))
+		if !poolGuardCanMigrate(sliceTyp.Elem) {
+			return
+		}
+		elemSize := sliceTyp.Elem.Size_
 		if elemSize == 0 {
 			return
 		}
@@ -447,7 +488,11 @@ func sync_poolGuardGet(typPtr, dataPtr unsafe.Pointer) {
 		if hdr.Cap == 0 {
 			return
 		}
-		elemSize := (*abi.SliceType)(unsafe.Pointer(typ)).Elem.Size_
+		sliceTyp := (*abi.SliceType)(unsafe.Pointer(typ))
+		if !poolGuardCanMigrate(sliceTyp.Elem) {
+			return
+		}
+		elemSize := sliceTyp.Elem.Size_
 		if elemSize == 0 {
 			return
 		}
