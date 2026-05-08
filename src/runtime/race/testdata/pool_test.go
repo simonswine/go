@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 func TestRacePool(t *testing.T) {
@@ -100,14 +101,32 @@ func TestNoRacePoolNew(t *testing.T) {
 // sink prevents dead-store elimination for reads from aliased pooled memory.
 var sink byte
 
-// TestRacePoolSliceBackingArrayReuse detects use-after-Pool.Put via a slice
-// alias, the in-process analogue of the Pyroscope buffer-reuse bug where a
-// pooled []byte is read after it has been returned to the pool.
-//
-// Note: Go's race detector does not instrument reads through string headers
-// (strings are spec-immutable), so the test uses a []byte sub-slice alias.
-// In the Pyroscope yoloString pattern the race is the same but only the write
-// side of a concurrent reuse goroutine is directly detectable.
+// yoloString aliases b's backing array as a string without copying, exactly
+// as unsafe index-reader libraries do (Prometheus TSDB, Pyroscope, etc.).
+func yoloString(b []byte) string {
+	return unsafe.String(unsafe.SliceData(b), len(b))
+}
+
+// TestRacePoolStringAlias is the Pyroscope/yoloString pattern: a pooled
+// []byte is aliased as a string, returned to the pool, then the string alias
+// is read after the backing array has been quarantined.  With string reads
+// instrumented by the race detector this fires a use-after-pool-put report.
+func TestRacePoolStringAlias(t *testing.T) {
+	p := &sync.Pool{New: func() any {
+		b := make([]byte, 5, 64)
+		copy(b, "hello")
+		return b
+	}}
+	for i := 0; i < 10; i++ {
+		buf := p.Get().([]byte)
+		alias := yoloString(buf) // unsafe string alias into backing array
+		p.Put(buf)               // backing array quarantined here
+		sink = alias[0]          // BUG: read of aliased backing array after Put
+	}
+}
+
+// TestRacePoolSliceBackingArrayReuse detects the same use-after-Put bug via a
+// []byte sub-slice alias (does not require string-read instrumentation).
 func TestRacePoolSliceBackingArrayReuse(t *testing.T) {
 	p := &sync.Pool{New: func() any { return make([]byte, 8, 64) }}
 	for i := 0; i < 10; i++ {
@@ -116,6 +135,22 @@ func TestRacePoolSliceBackingArrayReuse(t *testing.T) {
 		alias := buf[:1] // sub-slice alias into same backing array
 		p.Put(buf)       // backing array quarantined here
 		sink = alias[0]  // BUG: read of backing array after Put
+	}
+}
+
+// TestNoRacePoolStringCloned verifies that strings.Clone before Put (the
+// Pyroscope fix) produces no race: the cloned string is heap-independent.
+func TestNoRacePoolStringCloned(t *testing.T) {
+	p := &sync.Pool{New: func() any {
+		b := make([]byte, 5, 64)
+		copy(b, "hello")
+		return b
+	}}
+	for i := 0; i < 10; i++ {
+		buf := p.Get().([]byte)
+		safe := string(buf) // copy — independent of backing array
+		p.Put(buf)
+		sink = safe[0] // safe: no alias
 	}
 }
 

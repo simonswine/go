@@ -838,10 +838,16 @@ func IsSanitizerSafeAddr(v *Value) bool {
 	case OpSP, OpLocalAddr, OpSelectNAddr:
 		// Stack addresses are always safe.
 		return true
-	case OpITab, OpStringPtr, OpGetClosurePtr:
-		// Itabs, string data, and closure fields are
-		// read-only once initialized.
+	case OpITab, OpGetClosurePtr:
+		// Itabs and closure fields are read-only once initialized.
 		return true
+		// Note: OpStringPtr is intentionally NOT listed here. Although strings
+		// are immutable by the Go spec, unsafe.String / unsafe.SliceData can
+		// produce strings whose backing arrays alias mutable pooled buffers.
+		// Instrumenting string content reads lets the race detector catch
+		// use-after-pool-put bugs (e.g. the Pyroscope yoloString pattern).
+		// The overhead for constant-string reads is minimal: raceread returns
+		// immediately after failing the heap/data address-range check.
 	case OpAddr:
 		vt := v.Aux.(*obj.LSym).Type
 		return vt == objabi.SRODATA || vt == objabi.SLIBFUZZER_8BIT_COUNTER || vt == objabi.SCOVERAGE_COUNTER || vt == objabi.SCOVERAGE_AUXVAR
